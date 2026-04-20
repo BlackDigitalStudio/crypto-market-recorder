@@ -36,21 +36,24 @@ from chronos.gateway import DeribitCredentials, Gateway  # noqa: E402
 logger = logging.getLogger("chronos")
 
 
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
 def _default_root() -> Path:
     override = os.environ.get("CHRONOS_ROOT")
     if override:
         return Path(override)
-    default_home = Path("/home/scalper/scalper-bot/data_v2")
-    return default_home
+    return _REPO_ROOT / "data"
 
 
 def _load_config_env() -> None:
-    """Load key=value pairs from ./config.env into os.environ (if not set).
+    """Load key=value pairs from repo-root ``config.env`` into os.environ.
 
-    Same contract as the production recorder — supports credentials that
-    must never be committed. ``config.env`` is already in .gitignore.
+    Credentials never belong in the tracked source tree — ``config.env``
+    is in ``.gitignore``. We look relative to this script so Chronos can
+    ship as a self-contained deployment bundle.
     """
-    cfg = Path("/home/scalper/scalper-bot/config.env")
+    cfg = _REPO_ROOT / "config.env"
     if not cfg.exists():
         return
     for line in cfg.read_text().splitlines():
