@@ -32,7 +32,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-import pandas as pd
 import pyarrow as pa
 
 from . import normalize as norm
@@ -191,13 +190,23 @@ def _current_hour_key(now: datetime | None = None) -> str:
 
 
 def _rows_to_table(rows: list[dict], schema: pa.Schema) -> pa.Table:
-    df = pd.DataFrame(rows)
-    schema_cols = [f.name for f in schema]
-    for col in schema_cols:
-        if col not in df.columns:
-            df[col] = None
-    df = df[schema_cols]
-    return pa.Table.from_pandas(df, schema=schema, preserve_index=False, safe=False)
+    """Build an Arrow table directly from row dicts (no pandas round-trip).
+
+    pandas-based conversion held the GIL inside the flush thread pool —
+    even offloaded via ``asyncio.to_thread`` it starved the event loop
+    and produced ~1.2 GB/hour RSS growth from allocator fragmentation on
+    short-lived DataFrames. ``pa.array`` / ``pa.table`` build columns
+    in C and release the GIL for the bulk of the conversion work.
+    """
+    # Transpose list-of-dicts → dict-of-lists, matching schema order and
+    # filling missing columns with None (preserves nullable semantics).
+    cols: dict[str, list] = {f.name: [None] * len(rows) for f in schema}
+    for i, row in enumerate(rows):
+        for name in cols:
+            v = row.get(name)
+            if v is not None:
+                cols[name][i] = v
+    return pa.table(cols, schema=schema)
 
 
 class Recorder:
