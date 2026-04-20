@@ -229,6 +229,10 @@ class Recorder:
         self._books: dict[StreamKey, _BookBinding] = {}
         self._streams_lock = threading.Lock()
         self._flush_task: asyncio.Task | None = None
+        # Background hour-rollover compactions run fire-and-forget; we
+        # hold references so GC doesn't kill them mid-flight and so
+        # `stop()` can drain them before the process exits.
+        self._background_tasks: set[asyncio.Task] = set()
         self._running = False
 
     # --- lifecycle ---
@@ -737,13 +741,26 @@ class Recorder:
                 return_exceptions=True,
             )
 
-        # Hour rollover: compact every stream whose prior hour is closed.
+        # Hour rollover: spawn compactions in the background and return
+        # immediately. Waiting on gather() would block the next flush
+        # tick by the full compaction duration (~6 s on 24 streams with
+        # hour-worth parts), which in turn stalls WS ingestion and
+        # produces 5-10 s `local_ts_us` delays around the UTC boundary.
+        # Fire-and-forget is safe because (a) compactions are
+        # idempotent, (b) typical hour-compact finishes in a few
+        # seconds — well before the next hour rollover.
         compact_targets = [s for s in states if s.last_hour_key is not None and s.last_hour_key != hour_key]
-        if compact_targets:
-            await asyncio.gather(
-                *(asyncio.to_thread(self._compact_one_sync, s, s.last_hour_key) for s in compact_targets),
-                return_exceptions=True,
+        for s in compact_targets:
+            prior = s.last_hour_key
+            self._background_tasks.add(
+                asyncio.create_task(
+                    asyncio.to_thread(self._compact_one_sync, s, prior),
+                    name=f"compact-{s.key.rel_dir}-{prior}",
+                )
             )
+        # Reap completed background tasks so the set doesn't grow.
+        done = {t for t in self._background_tasks if t.done()}
+        self._background_tasks.difference_update(done)
 
         for state in states:
             state.last_hour_key = hour_key
@@ -755,10 +772,16 @@ class Recorder:
             logger.error("archive flush failed: %r", e)
 
         if final:
+            # On shutdown we DO wait — we want a fully compacted archive
+            # before the process exits.
             await asyncio.gather(
                 *(asyncio.to_thread(self._compact_one_sync, s, hour_key) for s in states),
                 return_exceptions=True,
             )
+            # Drain any still-running background compactions too.
+            if self._background_tasks:
+                await asyncio.gather(*self._background_tasks, return_exceptions=True)
+                self._background_tasks.clear()
 
     def _compact_one_sync(self, state: _StreamState, hour_key: str) -> None:
         try:
