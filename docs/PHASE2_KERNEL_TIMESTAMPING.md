@@ -506,6 +506,65 @@ a single giant commit — the review trail needs to be inspectable.
 
 ---
 
+## 10a. Development vs validation environment split
+
+This Phase is implemented under a two-environment workflow. The agent
+that picks up this spec runs on **GitHub Codespaces (or equivalent
+CI)**. Live acceptance validation is performed in a **separate short
+session on the Contabo Tokyo host** (which is also the production
+host for Chronos v1 and other unrelated workloads — do not hold that
+machine for dev iteration).
+
+### What the GitHub agent does
+
+- All 9 commits on a branch `phase2-kernel-ts`.
+- Full unit + integration test suite (`pytest tests/ -q`) passes on
+  every commit.
+- Integration tests use a local TLS echo server (spawn via
+  `asyncio.start_server` with self-signed cert) to exercise the
+  full `KernelTimestampedWSClient` round-trip.
+- Smoke tests may reach `fstream.binance.com:443` to verify TLS
+  handshake + `kernel_recv_ts_us` populates, but must **not** rely on
+  σ measurements from that connection (GitHub datacenter ↔ Binance
+  Tokyo has 150-300 ms RTT, which destroys the statistic this Phase
+  is measured by).
+- Optional but encouraged: add a GitHub Actions workflow at
+  `.github/workflows/test.yml` that runs the suite on every push and
+  PR.
+- Open a PR `phase2-kernel-ts → main`; do not merge. Title should
+  contain `READY FOR LIVE VALIDATION ON CONTABO` once green.
+
+### What the Contabo agent does (separate short session)
+
+- `git fetch origin; git checkout phase2-kernel-ts`.
+- Gracefully stop the running Chronos v1 process
+  (`pkill -INT -f 'chronos/scripts/record_data.py'`, wait ≥ 10 s for
+  final drain + compact).
+- Launch the Phase 2 build with
+  `CHRONOS_INGEST_MODE=kernel`, write to
+  `/home/scalper/chronos-data-phase2/` so the two archives stay
+  separable for comparison analysis.
+- Run for at least 1 hour continuous (use `ScheduleWakeup` to come
+  back).
+- Read the Phase 2 parquets and compute empirical σ of
+  `estimated_true_event_ts_us − exchange_event_ts_us` after the
+  first 10 min of estimator warm-up.
+- If σ ≤ 40 μs: write `docs/PHASE2_RESULTS.md` with the measured
+  numbers, commit to `phase2-kernel-ts`, update the PR description
+  with `VALIDATION PASSED σ=<value> μs`.
+- If σ > 40 μs: write the same file with the observed numbers and
+  note `VALIDATION FAILED` — hand back to the GitHub agent for
+  iteration without merging.
+- Switch back to Chronos v1 (`git checkout main` +
+  `CHRONOS_INGEST_MODE=aiohttp` + restart) so the production archive
+  continues on the proven path while the PR waits to be merged.
+
+The Contabo session is deliberately **short** (≤ 2 hours per round):
+all dev work happens on GitHub, and the Contabo machine is held
+only for the empirical statistic, never for iteration.
+
+---
+
 ## 11. What "done" looks like
 
 Live run on Contabo for 24 hours with
