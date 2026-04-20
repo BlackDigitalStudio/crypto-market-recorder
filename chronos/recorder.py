@@ -433,7 +433,7 @@ class Recorder:
             except (asyncio.CancelledError, Exception):
                 pass
         try:
-            self._drain_all(final=True)
+            await self._drain_all(final=True)
         except Exception as e:
             logger.error("final drain failed: %r", e)
         try:
@@ -687,15 +687,23 @@ class Recorder:
             except asyncio.CancelledError:
                 break
             try:
-                self._drain_all(final=False)
+                await self._drain_all(final=False)
                 self._touch_health()
             except Exception as e:
                 logger.error("flush loop error: %r", e)
 
-    def _drain_all(self, *, final: bool) -> None:
+    async def _drain_all(self, *, final: bool) -> None:
+        """Drain buffers + compact due hours, offloading disk I/O to threads.
+
+        All pyarrow writes and parquet compactions are dispatched via
+        :func:`asyncio.to_thread` so the event loop never blocks on
+        disk — otherwise a multi-second hour-rollover compaction would
+        stall WS ingestion and the corresponding messages would queue
+        up in the kernel TCP buffer, arriving with a 10-40 s ``local_ts``
+        delay relative to ``exchange_event_ts`` (observed 2026-04-20 at
+        39 s max latency on BTCUSDT aggTrade during hour 01→02 rollover).
+        """
         hour_key = _current_hour_key()
-        # Emit periodic checkpoints BEFORE draining so checkpoint rows
-        # from this tick are flushed with everything else.
         try:
             self._maybe_emit_checkpoints()
         except Exception as e:
@@ -704,56 +712,62 @@ class Recorder:
         with self._streams_lock:
             states = list(self._streams.values())
 
+        # Snapshot buffers quickly under lock, then write off-loop.
+        part_jobs: list[tuple[_StreamState, list[dict]]] = []
         for state in states:
             with state.lock:
                 rows = state.buffer
                 state.buffer = []
             if rows:
-                self._write_part(state, rows, hour_key)
+                part_jobs.append((state, rows))
 
-        for state in states:
-            prior = state.last_hour_key
-            if prior is not None and prior != hour_key:
-                try:
-                    self._parquet.compact_hour(
-                        stream_rel_dir=state.key.rel_dir,
-                        hour_key=prior,
-                        stream_type=state.key.stream_type,
-                        source_id=state.key.source_id,
-                        exchange=state.key.exchange,
-                        symbol=state.key.symbol,
-                    )
-                except Exception as e:
-                    logger.error(
-                        "compact %s/%s failed: %r", state.key.rel_dir, prior, e,
-                    )
+        # Fan part writes out to threads in parallel.
+        if part_jobs:
+            await asyncio.gather(
+                *(asyncio.to_thread(self._write_part_sync, s, r, hour_key) for s, r in part_jobs),
+                return_exceptions=True,
+            )
+
+        # Hour rollover: compact every stream whose prior hour is closed.
+        compact_targets = [s for s in states if s.last_hour_key is not None and s.last_hour_key != hour_key]
+        if compact_targets:
+            await asyncio.gather(
+                *(asyncio.to_thread(self._compact_one_sync, s, s.last_hour_key) for s in compact_targets),
+                return_exceptions=True,
+            )
 
         for state in states:
             state.last_hour_key = hour_key
 
+        # Raw-archive flush is a cheap Z_SYNC_FLUSH per open file; stay off-loop too.
         try:
-            self._archive.flush()
+            await asyncio.to_thread(self._archive.flush)
         except Exception as e:
             logger.error("archive flush failed: %r", e)
 
         if final:
-            for state in states:
-                try:
-                    self._parquet.compact_hour(
-                        stream_rel_dir=state.key.rel_dir,
-                        hour_key=hour_key,
-                        stream_type=state.key.stream_type,
-                        source_id=state.key.source_id,
-                        exchange=state.key.exchange,
-                        symbol=state.key.symbol,
-                    )
-                except Exception as e:
-                    logger.error(
-                        "final compact %s/%s failed: %r",
-                        state.key.rel_dir, hour_key, e,
-                    )
+            await asyncio.gather(
+                *(asyncio.to_thread(self._compact_one_sync, s, hour_key) for s in states),
+                return_exceptions=True,
+            )
 
-    def _write_part(self, state: _StreamState, rows: list[dict], hour_key: str) -> None:
+    def _compact_one_sync(self, state: _StreamState, hour_key: str) -> None:
+        try:
+            self._parquet.compact_hour(
+                stream_rel_dir=state.key.rel_dir,
+                hour_key=hour_key,
+                stream_type=state.key.stream_type,
+                source_id=state.key.source_id,
+                exchange=state.key.exchange,
+                symbol=state.key.symbol,
+            )
+        except Exception as e:
+            logger.error("compact %s/%s failed: %r", state.key.rel_dir, hour_key, e)
+
+    def _write_part_sync(
+        self, state: _StreamState, rows: list[dict], hour_key: str,
+    ) -> None:
+        """Thread-pool-safe part writer. Called via asyncio.to_thread."""
         try:
             table = _rows_to_table(rows, state.schema)
         except Exception as e:
