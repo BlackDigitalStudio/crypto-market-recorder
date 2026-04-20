@@ -305,9 +305,19 @@ class OrderBookV2:
 
         ``qty_tolerance`` lets the caller ignore microscopic rounding (e.g.
         ``1e-9``) that can arise when the exchange reissues an equivalent
-        level. ``max_price_levels`` optionally caps how deep we compare —
-        REST often returns 1000 levels while we may only maintain the top
-        500, so levels deeper than maintained should not be flagged.
+        level.
+
+        ``max_price_levels`` caps comparison to the top-N levels of each
+        side **on BOTH books** before diffing. Rationale: deep levels are
+        outside the window we contract to maintain, and comparing the
+        full 1000-level REST dump to a top-100 maintained view would
+        flag every deep level as "missing_rest" — a false positive that
+        triggered spurious reseeds in live deployment (observed
+        2026-04-20 at 14k findings/reconcile on healthy books). We
+        therefore prune local_book to the same N so comparison is
+        symmetric.
+
+        Passing ``None`` compares every level of both books.
         """
         rest_bids = dict(_floats(snapshot.get("bids") or []))
         rest_asks = dict(_floats(snapshot.get("asks") or []))
@@ -315,11 +325,16 @@ class OrderBookV2:
         if max_price_levels is not None:
             rest_bids = dict(sorted(rest_bids.items(), key=lambda kv: -kv[0])[:max_price_levels])
             rest_asks = dict(sorted(rest_asks.items(), key=lambda kv: kv[0])[:max_price_levels])
+            local_bids = dict(sorted(self._bids.items(), key=lambda kv: -kv[0])[:max_price_levels])
+            local_asks = dict(sorted(self._asks.items(), key=lambda kv: kv[0])[:max_price_levels])
+        else:
+            local_bids = self._bids
+            local_asks = self._asks
 
         findings: list[DriftFinding] = []
         for side, local_book, rest_book in (
-            ("bid", self._bids, rest_bids),
-            ("ask", self._asks, rest_asks),
+            ("bid", local_bids, rest_bids),
+            ("ask", local_asks, rest_asks),
         ):
             for p, q_local in local_book.items():
                 q_rest = rest_book.get(p)

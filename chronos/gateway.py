@@ -455,7 +455,19 @@ class Gateway:
             backoff = min(backoff * 2, self._backoff_max)
 
     async def _run_binance_reconcile(self, cfg: _BinanceFuturesConfig) -> None:
+        """Periodically compare maintained book to a fresh REST snapshot.
+
+        Findings are always recorded as INTEGRITY_GAP rows. A full book
+        reseed is triggered only when findings exceed
+        ``reseed_threshold_pct`` of the comparison window — low single-
+        digit drift is normal (race between our last WS diff and REST's
+        snapshot-of-the-moment) and does not warrant throwing away the
+        maintained state. The threshold defaults to 5% of the compared
+        level count.
+        """
         assert self._binance_rest is not None and cfg.depth_diff_key is not None
+        # Compared level count = 2 sides × snapshot_levels.
+        reseed_threshold = max(1, int(cfg.snapshot_levels * 2 * 0.05))
         await asyncio.sleep(cfg.reconcile_interval_sec)
         while self._running:
             try:
@@ -463,10 +475,17 @@ class Gateway:
                 n = self._rec.reconcile_with_rest(
                     cfg.depth_diff_key, body, max_price_levels=cfg.snapshot_levels,
                 )
-                if n:
+                if n == 0:
+                    logger.debug("reconcile %s clean", cfg.symbol)
+                elif n < reseed_threshold:
+                    logger.info(
+                        "reconcile minor drift %s — findings=%d (< reseed threshold=%d)",
+                        cfg.symbol, n, reseed_threshold,
+                    )
+                else:
                     logger.warning(
-                        "reconcile drift for %s — findings=%d; reseeding book",
-                        cfg.symbol, n,
+                        "reconcile major drift %s — findings=%d (>= threshold=%d); reseeding book",
+                        cfg.symbol, n, reseed_threshold,
                     )
                     self._rec.ingest_rest_snapshot(cfg.depth_diff_key, body)
             except asyncio.CancelledError:
