@@ -1,0 +1,37 @@
+[Unit]
+Description=Chronos market-data recorder
+After=network-online.target chrony.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=chronos
+Group=chronos
+WorkingDirectory=/opt/chronos
+EnvironmentFile=-/opt/chronos/config.env
+ExecStart=/opt/chronos/venv/bin/python /opt/chronos/scripts/record_data.py
+Restart=always
+RestartSec=5
+
+# Graceful shutdown: SIGINT handled inside the script; allow 30 s for
+# flush + compact before SIGKILL.
+KillSignal=SIGINT
+TimeoutStopSec=30
+
+# Hardening.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/data/chronos /var/log/chronos
+
+# Resource limits — recorder under normal load: <300 MB RAM, <30% CPU.
+# Give headroom for WebSocket burst traffic.
+MemoryMax=2G
+CPUQuota=200%
+
+StandardOutput=append:/var/log/chronos/chronos.log
+StandardError=append:/var/log/chronos/chronos.log
+
+[Install]
+WantedBy=multi-user.target
