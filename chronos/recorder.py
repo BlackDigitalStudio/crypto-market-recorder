@@ -233,6 +233,11 @@ class Recorder:
         # hold references so GC doesn't kill them mid-flight and so
         # `stop()` can drain them before the process exits.
         self._background_tasks: set[asyncio.Task] = set()
+        # Limit concurrent compactions — on a 16-core host, 24 parallel
+        # compaction threads saturate CPU at rollover and starve the
+        # asyncio event loop, causing WS-ingestion latency spikes of
+        # multiple seconds. 4 concurrent leaves ≥12 cores for WS + REST.
+        self._compact_semaphore = asyncio.Semaphore(4)
         self._running = False
 
     # --- lifecycle ---
@@ -754,7 +759,7 @@ class Recorder:
             prior = s.last_hour_key
             self._background_tasks.add(
                 asyncio.create_task(
-                    asyncio.to_thread(self._compact_one_sync, s, prior),
+                    self._compact_with_semaphore(s, prior),
                     name=f"compact-{s.key.rel_dir}-{prior}",
                 )
             )
@@ -782,6 +787,19 @@ class Recorder:
             if self._background_tasks:
                 await asyncio.gather(*self._background_tasks, return_exceptions=True)
                 self._background_tasks.clear()
+
+    async def _compact_with_semaphore(self, state: _StreamState, hour_key: str) -> None:
+        """Bounded-concurrency wrapper around :meth:`_compact_one_sync`.
+
+        Compactions are CPU+I/O heavy. On a shared-CPU host even 4-8 of
+        them running at once is enough work; letting all 20-plus streams
+        compact simultaneously starves the asyncio event loop that is
+        trying to service WebSocket callbacks, producing visible
+        `local_ts_us` latency spikes. The semaphore caps in-flight
+        compactions at 4.
+        """
+        async with self._compact_semaphore:
+            await asyncio.to_thread(self._compact_one_sync, state, hour_key)
 
     def _compact_one_sync(self, state: _StreamState, hour_key: str) -> None:
         try:
