@@ -199,6 +199,7 @@ def _rest_poll(msg: dict) -> tuple[int | None, int | None]:
 _EXTRACTORS: dict[tuple[str, str], Any] = {
     ("binance_futures_ws", "depthUpdate"): _binance_envelope,
     ("binance_futures_ws", "aggTrade"): _binance_envelope,
+    ("binance_futures_ws", "trade"): _binance_envelope,
     ("binance_futures_ws", "markPriceUpdate"): _binance_mark_price,
     ("binance_futures_ws", "forceOrder"): _binance_force_order,
     ("bybit_v5_public_linear", "publicTrade"): _bybit_envelope_and_first_trade,
