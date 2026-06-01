@@ -309,8 +309,14 @@ class Gateway:
             return
         self._running = True
         if self._session is None:
+            # Each Binance stream is its own persistent WS connection, all to
+            # fstream.binance.com. A multi-symbol fleet needs many: N symbols x
+            # {depth, aggTrade, markPrice, forceOrder} = 4N to one host. The old
+            # limit_per_host=8 starved everything past the first ~8 (depth won
+            # the race; trade/mark/liq timed out forever at 16 symbols). Lift the
+            # per-host cap and raise the total pool accordingly.
             self._session = aiohttp.ClientSession(
-                connector=aiohttp.TCPConnector(limit=64, limit_per_host=8),
+                connector=aiohttp.TCPConnector(limit=256, limit_per_host=0),
             )
             self._own_session = True
         self._binance_rest = BinanceFuturesREST(self._session)
