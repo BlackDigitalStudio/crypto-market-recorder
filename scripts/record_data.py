@@ -6,6 +6,12 @@ Usage::
     CHRONOS_ROOT=/path/data_v2 python scripts/record_data_v2.py
     CHRONOS_CONFIG=/path/streams.yaml python scripts/record_data_v2.py
 
+    # Override the Binance symbol set + book depth via env (defaults keep
+    # the original BTC/ETH @ L100 full-book behaviour):
+    CHRONOS_BINANCE_SYMBOLS="BTCUSDT,BTCUSDC,ETHUSDT,ETHUSDC" \
+    CHRONOS_DEPTH_LEVELS=20 CHRONOS_BOOK_MAX_LEVELS=100 CHRONOS_SEED_LIMIT=100 \
+        python scripts/record_data_v2.py
+
 Default config (no YAML needed):
 
 - Binance futures BTCUSDT + ETHUSDT: depth@100ms (L100 maintained book +
@@ -75,6 +81,26 @@ def _deribit_credentials_from_env() -> DeribitCredentials | None:
     return None
 
 
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, "")
+    raw = raw.strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("ignoring invalid %s=%r (expected int)", name, raw)
+        return default
+
+
+def _binance_symbols() -> list[str]:
+    """Binance USDⓈ-M symbols to record. Override via ``CHRONOS_BINANCE_SYMBOLS``
+    (comma-separated, e.g. ``BTCUSDT,BTCUSDC,ETHUSDT``). Default: BTC/ETH USDT."""
+    raw = os.environ.get("CHRONOS_BINANCE_SYMBOLS", "")
+    syms = [s.strip().upper() for s in raw.split(",") if s.strip()]
+    return syms or ["BTCUSDT", "ETHUSDT"]
+
+
 async def _main() -> None:
     log_fmt = "%(asctime)s.%(msecs)03d %(levelname)-5s [%(name)s] %(message)s"
     logging.basicConfig(
@@ -98,10 +124,24 @@ async def _main() -> None:
     gateway = Gateway(recorder)
 
     # --- Binance futures -------------------------------------------------
-    for symbol in ("BTCUSDT", "ETHUSDT"):
+    # Symbol set + book depth are env-overridable (defaults preserve the
+    # original BTC/ETH @ L100 full-book behaviour):
+    #   CHRONOS_BINANCE_SYMBOLS  comma-separated, e.g. "BTCUSDT,BTCUSDC,ETHUSDT"
+    #   CHRONOS_DEPTH_LEVELS     emitted depth_snapshot levels   (default 100)
+    #   CHRONOS_BOOK_MAX_LEVELS  cap maintained book per side    (default 0 = no cap)
+    #   CHRONOS_SEED_LIMIT       REST snapshot/reconcile depth   (default 1000)
+    symbols = _binance_symbols()
+    snapshot_levels = _env_int("CHRONOS_DEPTH_LEVELS", 100)
+    book_max_levels = _env_int("CHRONOS_BOOK_MAX_LEVELS", 0) or None
+    seed_limit = _env_int("CHRONOS_SEED_LIMIT", 1000)
+    logger.info(
+        "binance: symbols=%s depth=L%d book_max_levels=%s seed_limit=%d",
+        symbols, snapshot_levels, book_max_levels, seed_limit,
+    )
+    for symbol in symbols:
         gateway.add_binance_futures(
             symbol,
-            snapshot_levels=100,
+            snapshot_levels=snapshot_levels,
             maintain_book=True,
             subscribe_force_order=True,
             # fstream3 replica returns a WAF 302 from Tokyo IPs; leave the
@@ -110,6 +150,8 @@ async def _main() -> None:
             subscribe_secondary_endpoint=False,
             reconcile_interval_sec=900.0,
             derivatives_poll_interval_sec=15.0,
+            book_max_levels=book_max_levels,
+            seed_limit=seed_limit,
         )
 
     # --- Cross-venue trades ---------------------------------------------
