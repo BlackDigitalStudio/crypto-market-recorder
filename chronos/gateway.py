@@ -173,8 +173,12 @@ class Gateway:
             cfg.depth_diff_key = StreamKey(src, cfg.exchange_tag, sym,
                                            StreamType.DEPTH_DIFF, "depthUpdate")
         if cfg.subscribe_agg_trade:
+            # Use the raw @trade stream, not @aggTrade: aggTrade currently
+            # delivers no frames over WS (subscription acks but stays silent),
+            # while @trade streams normally — and @trade (per-fill id) maps
+            # more directly onto the Cryptolake raw/trades schema.
             cfg.agg_trade_key = StreamKey(src, cfg.exchange_tag, sym,
-                                          StreamType.TRADE, "aggTrade")
+                                          StreamType.TRADE, "trade")
             self._rec.register(cfg.agg_trade_key)
         if cfg.subscribe_mark_price:
             cfg.mark_price_key = StreamKey(src, cfg.exchange_tag, sym,
@@ -413,7 +417,7 @@ class Gateway:
             if cfg.subscribe_depth and cfg.depth_diff_key is not None:
                 specs.append((f"{sl}@depth@100ms", cfg.depth_diff_key, "u"))
             if cfg.subscribe_agg_trade and cfg.agg_trade_key is not None:
-                specs.append((f"{sl}@aggTrade", cfg.agg_trade_key, "a"))
+                specs.append((f"{sl}@trade", cfg.agg_trade_key, "t"))
             if cfg.subscribe_mark_price and cfg.mark_price_key is not None:
                 specs.append((f"{sl}@markPrice@1s", cfg.mark_price_key, None))
             if cfg.subscribe_force_order and cfg.force_order_key is not None:

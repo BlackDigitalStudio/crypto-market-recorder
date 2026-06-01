@@ -59,6 +59,7 @@ HEALTH_FILE_DEFAULT = "/tmp/chronos_health"
 _NORMALIZERS: dict[tuple[str, str], Callable[..., list[dict]]] = {
     ("binance_futures_ws", "depthUpdate"): norm.normalize_binance_depth_update,
     ("binance_futures_ws", "aggTrade"): norm.normalize_binance_agg_trade,
+    ("binance_futures_ws", "trade"): norm.normalize_binance_trade,
     ("binance_futures_ws", "markPriceUpdate"): norm.normalize_binance_mark_price,
     ("binance_futures_ws", "forceOrder"): norm.normalize_binance_force_order,
     ("bybit_v5_public_linear", "publicTrade"): norm.normalize_bybit_public_trade,

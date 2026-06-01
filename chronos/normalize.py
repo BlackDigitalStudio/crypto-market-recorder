@@ -102,6 +102,24 @@ def normalize_binance_agg_trade(
     }]
 
 
+def normalize_binance_trade(
+    msg: dict, *, ts: Timestamps, source_id: str, symbol: str,
+) -> list[dict]:
+    """Binance USDⓈ-M `@trade` (individual prints). Unlike `@aggTrade` these
+    carry a per-trade id `t` and no aggregate `f`/`l` window — closer to the
+    Cryptolake `raw/trades` schema (one row per fill with an `id`)."""
+    tid = msg.get("t")
+    return [{
+        **_preamble_row(ts=ts, source_id=source_id, symbol=symbol),
+        "trade_id": str(tid) if tid is not None else None,
+        "price": _f(msg.get("p")),
+        "qty": _f(msg.get("q")),
+        "is_buyer_maker": bool(msg.get("m", False)),
+        "first_trade_id": None,
+        "last_trade_id": None,
+    }]
+
+
 def normalize_binance_mark_price(
     msg: dict, *, ts: Timestamps, source_id: str, symbol: str,
 ) -> list[dict]:
