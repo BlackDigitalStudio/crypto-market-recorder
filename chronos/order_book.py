@@ -73,9 +73,10 @@ class OrderBookV2:
         "_synced",
         "_first_applied_update_id",
         "_applied_diffs",
+        "_max_levels",
     )
 
-    def __init__(self, symbol: str) -> None:
+    def __init__(self, symbol: str, *, max_levels: int | None = None) -> None:
         self.symbol = symbol
         self._bids: dict[float, float] = {}
         self._asks: dict[float, float] = {}
@@ -83,6 +84,22 @@ class OrderBookV2:
         self._synced: bool = False
         self._first_applied_update_id: int | None = None
         self._applied_diffs: int = 0
+        # Cap maintained depth to top-N per side. Binance @depth diffs cover
+        # the FULL book, so without this the dicts grow unbounded (the source
+        # of multi-GB RSS at scale). None = keep everything (upstream default).
+        self._max_levels: int | None = max_levels
+
+    def _prune(self) -> None:
+        """Drop levels beyond ``_max_levels`` (best prices kept) per side."""
+        m = self._max_levels
+        if m is None:
+            return
+        if len(self._bids) > m:
+            keep = sorted(self._bids, reverse=True)[:m]
+            self._bids = {p: self._bids[p] for p in keep}
+        if len(self._asks) > m:
+            keep = sorted(self._asks)[:m]
+            self._asks = {p: self._asks[p] for p in keep}
 
     # --- state queries ---
 
@@ -127,6 +144,7 @@ class OrderBookV2:
         self._synced = True
         self._first_applied_update_id = None
         self._applied_diffs = 0
+        self._prune()
 
     # --- WS diff application ---
 
@@ -177,6 +195,7 @@ class OrderBookV2:
             if self._first_applied_update_id is None:
                 self._first_applied_update_id = u_int
         self._applied_diffs += 1
+        self._prune()
         return changes
 
     # --- inspection ---

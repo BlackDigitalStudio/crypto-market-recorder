@@ -56,6 +56,10 @@ class _BinanceFuturesConfig:
     source_id: str = "binance_futures_ws"
     snapshot_levels: int = 100
     maintain_book: bool = True
+    # Cap maintained book depth per side (None = keep full book). REST seed /
+    # reconcile fetch depth (valid Binance values: 5/10/20/50/100/500/1000).
+    book_max_levels: int | None = None
+    seed_limit: int = 1000
     subscribe_depth: bool = True
     subscribe_agg_trade: bool = True
     subscribe_mark_price: bool = True
@@ -143,11 +147,15 @@ class Gateway:
         subscribe_secondary_endpoint: bool = True,
         reconcile_interval_sec: float = 900.0,
         derivatives_poll_interval_sec: float = 15.0,
+        book_max_levels: int | None = None,
+        seed_limit: int = 1000,
     ) -> _BinanceFuturesConfig:
         cfg = _BinanceFuturesConfig(
             symbol=symbol.upper(),
             snapshot_levels=snapshot_levels,
             maintain_book=maintain_book,
+            book_max_levels=book_max_levels,
+            seed_limit=seed_limit,
             subscribe_force_order=subscribe_force_order,
             subscribe_secondary_endpoint=subscribe_secondary_endpoint,
             reconcile_interval_sec=reconcile_interval_sec,
@@ -160,6 +168,7 @@ class Gateway:
             self._rec.register_maintained_book(
                 source_id=src, exchange=cfg.exchange_tag, symbol=sym,
                 snapshot_levels=snapshot_levels,
+                book_max_levels=book_max_levels,
             )
             cfg.depth_diff_key = StreamKey(src, cfg.exchange_tag, sym,
                                            StreamType.DEPTH_DIFF, "depthUpdate")
@@ -350,7 +359,7 @@ class Gateway:
         assert self._binance_rest is not None and cfg.depth_diff_key is not None
         for attempt in range(3):
             try:
-                body = await self._binance_rest.depth_snapshot(cfg.symbol, limit=1000)
+                body = await self._binance_rest.depth_snapshot(cfg.symbol, limit=cfg.seed_limit)
                 self._rec.ingest_rest_snapshot(cfg.depth_diff_key, body)
                 return
             except Exception as e:
@@ -471,7 +480,7 @@ class Gateway:
         await asyncio.sleep(cfg.reconcile_interval_sec)
         while self._running:
             try:
-                body = await self._binance_rest.depth_snapshot(cfg.symbol, limit=1000)
+                body = await self._binance_rest.depth_snapshot(cfg.symbol, limit=cfg.seed_limit)
                 n = self._rec.reconcile_with_rest(
                     cfg.depth_diff_key, body, max_price_levels=cfg.snapshot_levels,
                 )
