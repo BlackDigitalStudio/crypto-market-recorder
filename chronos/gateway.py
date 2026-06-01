@@ -323,11 +323,15 @@ class Gateway:
 
         await self._rec.start()
 
-        # Seed maintained books + kick off Binance tasks.
+        # Seed maintained books + kick off per-symbol REST loops (reconcile +
+        # derivatives). Market-data WS streams are multiplexed separately.
         for cfg in self._binance_configs:
             if cfg.maintain_book and cfg.depth_diff_key is not None:
                 await self._seed_binance_book(cfg)
             self._tasks.extend(self._launch_binance_tasks(cfg))
+        # All Binance depth/aggTrade/markPrice/forceOrder over a few combined
+        # connections (not 4N single-stream sockets).
+        self._tasks.extend(self._launch_binance_combined())
 
         # Simple venues.
         for venue in self._simple_venues:
@@ -379,52 +383,12 @@ class Gateway:
     # --- Binance futures runners --------------------------------------
 
     def _launch_binance_tasks(self, cfg: _BinanceFuturesConfig) -> list[asyncio.Task]:
+        # Market-data WS streams (depth/aggTrade/markPrice/forceOrder) are no
+        # longer one-connection-each — they are multiplexed over a few combined
+        # streams (see _launch_binance_combined), because 4N single-stream
+        # connections tripped Binance's per-IP connection limits. This method
+        # now only launches the per-symbol REST loops (reconcile + derivatives).
         tasks: list[asyncio.Task] = []
-        sym_lower = cfg.symbol.lower()
-
-        if cfg.subscribe_depth and cfg.depth_diff_key is not None:
-            primary_url = f"{BINANCE_FUTURES_WS_PRIMARY}/ws/{sym_lower}@depth@100ms"
-            tasks.append(asyncio.create_task(
-                self._run_binance_stream(
-                    url=primary_url, key=cfg.depth_diff_key,
-                    dedupe_id_field="u", name=f"{cfg.symbol}-depth-primary",
-                )
-            ))
-            if cfg.subscribe_secondary_endpoint:
-                secondary_url = f"{BINANCE_FUTURES_WS_FALLBACK}/ws/{sym_lower}@depth@100ms"
-                tasks.append(asyncio.create_task(
-                    self._run_binance_stream(
-                        url=secondary_url, key=cfg.depth_diff_key,
-                        dedupe_id_field="u", name=f"{cfg.symbol}-depth-fallback",
-                    )
-                ))
-
-        if cfg.subscribe_agg_trade and cfg.agg_trade_key is not None:
-            url = f"{BINANCE_FUTURES_WS_PRIMARY}/ws/{sym_lower}@aggTrade"
-            tasks.append(asyncio.create_task(
-                self._run_binance_stream(
-                    url=url, key=cfg.agg_trade_key,
-                    dedupe_id_field="a", name=f"{cfg.symbol}-aggTrade",
-                )
-            ))
-
-        if cfg.subscribe_mark_price and cfg.mark_price_key is not None:
-            url = f"{BINANCE_FUTURES_WS_PRIMARY}/ws/{sym_lower}@markPrice@1s"
-            tasks.append(asyncio.create_task(
-                self._run_binance_stream(
-                    url=url, key=cfg.mark_price_key,
-                    dedupe_id_field=None, name=f"{cfg.symbol}-markPrice",
-                )
-            ))
-
-        if cfg.subscribe_force_order and cfg.force_order_key is not None:
-            url = f"{BINANCE_FUTURES_WS_PRIMARY}/ws/{sym_lower}@forceOrder"
-            tasks.append(asyncio.create_task(
-                self._run_binance_stream(
-                    url=url, key=cfg.force_order_key,
-                    dedupe_id_field=None, name=f"{cfg.symbol}-forceOrder",
-                )
-            ))
 
         if cfg.maintain_book and cfg.depth_diff_key is not None:
             tasks.append(asyncio.create_task(self._run_binance_reconcile(cfg)))
@@ -432,6 +396,81 @@ class Gateway:
             tasks.append(asyncio.create_task(self._run_binance_derivatives_poll(cfg)))
 
         return tasks
+
+    # --- Binance combined market-data streams (P9-friendly) ------------
+    # One connection multiplexes many streams via /stream?streams=a/b/c.
+    # Binance allows up to ~200 streams per connection; we chunk well under
+    # that so a single reconnect never drops the whole fleet, while keeping
+    # the connection count tiny (vs 4N single-stream sockets that tripped the
+    # per-IP connection limit and produced a permanent reconnect storm).
+    _COMBINED_CHUNK = 16
+
+    def _binance_stream_specs(self) -> list[tuple[str, StreamKey, str | None]]:
+        """(binance stream name, target StreamKey, dedupe id field)."""
+        specs: list[tuple[str, StreamKey, str | None]] = []
+        for cfg in self._binance_configs:
+            sl = cfg.symbol.lower()
+            if cfg.subscribe_depth and cfg.depth_diff_key is not None:
+                specs.append((f"{sl}@depth@100ms", cfg.depth_diff_key, "u"))
+            if cfg.subscribe_agg_trade and cfg.agg_trade_key is not None:
+                specs.append((f"{sl}@aggTrade", cfg.agg_trade_key, "a"))
+            if cfg.subscribe_mark_price and cfg.mark_price_key is not None:
+                specs.append((f"{sl}@markPrice@1s", cfg.mark_price_key, None))
+            if cfg.subscribe_force_order and cfg.force_order_key is not None:
+                specs.append((f"{sl}@forceOrder", cfg.force_order_key, None))
+        return specs
+
+    def _launch_binance_combined(self) -> list[asyncio.Task]:
+        specs = self._binance_stream_specs()
+        tasks: list[asyncio.Task] = []
+        for i in range(0, len(specs), self._COMBINED_CHUNK):
+            chunk = specs[i:i + self._COMBINED_CHUNK]
+            tasks.append(asyncio.create_task(
+                self._run_binance_combined(chunk, idx=i // self._COMBINED_CHUNK)
+            ))
+        return tasks
+
+    async def _run_binance_combined(
+        self, specs: list[tuple[str, StreamKey, str | None]], *, idx: int,
+    ) -> None:
+        routing = {name: (key, df) for name, key, df in specs}
+        stream_path = "/".join(name for name, _, _ in specs)
+        url = f"{BINANCE_FUTURES_WS_PRIMARY}/stream?streams={stream_path}"
+        name = f"binance-combined-{idx}"
+        backoff = self._backoff_initial
+        while self._running:
+            try:
+                assert self._session is not None
+                async with self._session.ws_connect(url, heartbeat=20) as ws:
+                    logger.info("WS %s connected (%d streams)", name, len(specs))
+                    backoff = self._backoff_initial
+                    last_data = time.monotonic()
+                    async for msg in ws:
+                        if not self._running:
+                            break
+                        if msg.type == aiohttp.WSMsgType.TEXT:
+                            env = orjson.loads(msg.data)
+                            sn = env.get("stream")
+                            data = env.get("data")
+                            if sn is None or data is None:
+                                continue
+                            last_data = time.monotonic()
+                            route = routing.get(sn)
+                            if route is None:
+                                continue
+                            key, df = route
+                            self._feed(key, data, dedupe_id=(data.get(df) if df else None))
+                        elif msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSED):
+                            break
+                        if time.monotonic() - last_data > self._idle_max:
+                            logger.warning("WS %s idle → reconnect", name)
+                            break
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                logger.error("WS %s error: %r", name, e)
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, self._backoff_max)
 
     async def _run_binance_stream(
         self,
