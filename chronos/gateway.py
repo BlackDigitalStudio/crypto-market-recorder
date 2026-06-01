@@ -441,6 +441,14 @@ class Gateway:
         stream_path = "/".join(name for name, _, _ in specs)
         url = f"{BINANCE_FUTURES_WS_PRIMARY}/stream?streams={stream_path}"
         name = f"binance-combined-{idx}"
+        # Maintained books carried by this connection — re-seeded on reconnect.
+        chunk_keys = {key for _, key, _ in specs}
+        depth_cfgs = [
+            cfg for cfg in self._binance_configs
+            if cfg.maintain_book and cfg.depth_diff_key is not None
+            and cfg.depth_diff_key in chunk_keys
+        ]
+        first_connect = True
         backoff = self._backoff_initial
         while self._running:
             try:
@@ -448,6 +456,19 @@ class Gateway:
                 async with self._session.ws_connect(url, heartbeat=20) as ws:
                     logger.info("WS %s connected (%d streams)", name, len(specs))
                     backoff = self._backoff_initial
+                    # A reconnect means we missed depth diffs -> sequence gap.
+                    # Re-seed the affected books from REST immediately (the WS
+                    # diffs buffered during the fetch drain afterwards and are
+                    # filtered by the snapshot's lastUpdateId), instead of
+                    # waiting up to ~15 min for the periodic reconcile.
+                    if not first_connect and depth_cfgs:
+                        for cfg in depth_cfgs:
+                            try:
+                                await self._seed_binance_book(cfg)
+                            except Exception as e:
+                                logger.error("resync %s after reconnect failed: %r", cfg.symbol, e)
+                        logger.info("WS %s resynced %d book(s) after reconnect", name, len(depth_cfgs))
+                    first_connect = False
                     last_data = time.monotonic()
                     async for msg in ws:
                         if not self._running:
