@@ -196,6 +196,10 @@ def default_validators_for(source_id: str, channel: str) -> list[Validator]:
             return [DepthSequenceValidator()]
         if channel == "aggTrade":
             return [MonotonicIdValidator(id_key="a", gap_prefix="aggtrade_id")]
+        if channel == "trade":
+            # @trade per-fill id `t` is sequential per symbol; a jump flags
+            # trades missed across a reconnect (recorded as integrity_gap).
+            return [MonotonicIdValidator(id_key="t", gap_prefix="trade_id")]
     # Other venues get defaults as their gap semantics get modeled (lands
     # alongside P15 per-exchange quirks).
     return []
