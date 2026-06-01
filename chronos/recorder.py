@@ -290,6 +290,7 @@ class Recorder:
         snapshot_levels: int = 100,
         checkpoint_interval_sec: float = 300.0,
         snapshot_every_n_diffs: int = 1,
+        book_max_levels: int | None = None,
     ) -> OrderBookV2:
         """Attach a maintained :class:`OrderBookV2` to a depth-diff stream.
 
@@ -314,7 +315,7 @@ class Recorder:
         self._register_raw(snap_key)
         self._register_raw(cp_key)
 
-        book = OrderBookV2(symbol=symbol)
+        book = OrderBookV2(symbol=symbol, max_levels=book_max_levels)
         binding = _BookBinding(
             book=book,
             depth_diff_key=diff_key,
