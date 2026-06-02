@@ -32,6 +32,7 @@ from .recorder import (
     integrity_key_for,
 )
 from .rest_client import BinanceFuturesREST
+from .timestamps import now_us
 from .version import StreamType
 
 logger = logging.getLogger(__name__)
@@ -84,6 +85,24 @@ class _VenueTradeConfig:
     trade_key: StreamKey | None = None
 
 
+@dataclass
+class _VenueDepthConfig:
+    """Cross-venue order-book snapshot (for cross-exchange OBI features).
+
+    Variant A (native snapshot channels): Gate/Bitget/OKX push full top-N
+    snapshots (stateless), Bybit pushes snapshot+delta (maintained). Each
+    emits the shared DEPTH_SNAPSHOT stream at the venue's native depth.
+    """
+    source_id: str
+    exchange_tag: str
+    symbol: str
+    depth_levels: int
+    ws_url: str
+    subscribe_payload: dict[str, Any]
+    maintain: bool = False           # True for Bybit (snapshot+delta book)
+    depth_key: StreamKey | None = None
+
+
 @dataclass(frozen=True)
 class DeribitCredentials:
     """Deribit API key pair for WS `public/auth`.
@@ -124,6 +143,7 @@ class Gateway:
         self._binance_rest: BinanceFuturesREST | None = None
         self._binance_configs: list[_BinanceFuturesConfig] = []
         self._simple_venues: list[_VenueTradeConfig] = []
+        self._venue_depths: list[_VenueDepthConfig] = []
         self._coinbase_products: list[str] = []
         self._deribit_instruments: list[str] = []
         self._deribit_credentials: DeribitCredentials | None = None
@@ -260,6 +280,42 @@ class Gateway:
         self._rec.register(key)
         return key
 
+    # --- cross-venue order-book snapshots (Variant A) -----------------
+
+    def _add_venue_depth(self, cfg: _VenueDepthConfig) -> StreamKey:
+        cfg.depth_key = StreamKey(
+            cfg.source_id, cfg.exchange_tag, cfg.symbol,
+            StreamType.DEPTH_SNAPSHOT, "depth_snapshot",
+            depth_levels=cfg.depth_levels,
+        )
+        self._rec._register_raw(cfg.depth_key)
+        self._venue_depths.append(cfg)
+        return cfg.depth_key
+
+    def add_bybit_depth(self, symbol: str) -> StreamKey:
+        sym = symbol.upper()
+        return self._add_venue_depth(_VenueDepthConfig(
+            "bybit_v5_public_linear", "bybit", sym, 20, BYBIT_WS,
+            {"op": "subscribe", "args": ["orderbook.50." + sym]}, maintain=True))
+
+    def add_okx_depth(self, inst_id: str) -> StreamKey:
+        return self._add_venue_depth(_VenueDepthConfig(
+            "okx_v5_public", "okx", inst_id, 5, OKX_WS,
+            {"op": "subscribe", "args": [{"channel": "books5", "instId": inst_id}]}))
+
+    def add_bitget_depth(self, symbol: str) -> StreamKey:
+        sym = symbol.upper()
+        return self._add_venue_depth(_VenueDepthConfig(
+            "bitget_v2_public", "bitget", sym, 15, BITGET_WS,
+            {"op": "subscribe", "args": [{"instType": "USDT-FUTURES",
+                                          "channel": "books15", "instId": sym}]}))
+
+    def add_gateio_depth(self, contract: str) -> StreamKey:
+        return self._add_venue_depth(_VenueDepthConfig(
+            "gateio_v4_futures", "gateio", contract, 20, GATEIO_FUTURES_WS,
+            {"channel": "futures.order_book", "event": "subscribe",
+             "payload": [contract, "20", "0"]}))
+
     def add_deribit_trades(
         self,
         instrument_name: str,
@@ -340,6 +396,10 @@ class Gateway:
         # Simple venues.
         for venue in self._simple_venues:
             self._tasks.append(asyncio.create_task(self._run_simple_venue(venue)))
+
+        # Cross-venue order-book snapshots.
+        for vd in self._venue_depths:
+            self._tasks.append(asyncio.create_task(self._run_venue_depth(vd)))
 
         # Coinbase + Deribit need multi-instrument subscription frames.
         if self._coinbase_products:
@@ -660,6 +720,138 @@ class Gateway:
             backoff = min(backoff * 2, self._backoff_max)
 
     # --- Coinbase --------------------------------------------------------
+
+    # --- cross-venue depth runner -------------------------------------
+
+    @staticmethod
+    def _fp(x: Any) -> float | None:
+        try:
+            return float(x)
+        except (TypeError, ValueError):
+            return None
+
+    def _depth_row(self, source_id: str, symbol: str, levels: int,
+                   event_ts_ms: Any, bids: list, asks: list) -> dict:
+        bp = [0.0] * levels; bq = [0.0] * levels
+        ap = [0.0] * levels; aq = [0.0] * levels
+        for i, (p, q) in enumerate(sorted(bids, key=lambda x: -x[0])[:levels]):
+            bp[i] = p; bq[i] = q
+        for i, (p, q) in enumerate(sorted(asks, key=lambda x: x[0])[:levels]):
+            ap[i] = p; aq[i] = q
+        ets = None
+        try:
+            ets = int(event_ts_ms) * 1000 if event_ts_ms else None
+        except (TypeError, ValueError):
+            ets = None
+        return {
+            "local_ts_us": now_us(), "exchange_event_ts_us": ets,
+            "exchange_trans_ts_us": None, "source_id": source_id,
+            "symbol": symbol, "depth_levels": levels,
+            "first_update_id": None, "final_update_id": None, "prev_final_update_id": None,
+            "bid_prices": bp, "bid_qtys": bq, "ask_prices": ap, "ask_qtys": aq,
+        }
+
+    def _parse_venue_depth(self, cfg: _VenueDepthConfig, d: dict, book: dict | None) -> list:
+        et, lv, sid, sym, fp = cfg.exchange_tag, cfg.depth_levels, cfg.source_id, cfg.symbol, self._fp
+        if et == "gateio":
+            if d.get("event") != "all":
+                return []
+            r = d.get("result") or {}
+            bids = [(fp(x.get("p")), fp(x.get("s"))) for x in (r.get("bids") or [])]
+            asks = [(fp(x.get("p")), fp(x.get("s"))) for x in (r.get("asks") or [])]
+            bids = [(p, q) for p, q in bids if p is not None and q is not None]
+            asks = [(p, q) for p, q in asks if p is not None and q is not None]
+            return [self._depth_row(sid, sym, lv, r.get("t"), bids, asks)]
+        if et in ("okx", "bitget"):
+            if et == "bitget" and d.get("action") != "snapshot":
+                return []
+            data = d.get("data")
+            if not data:
+                return []
+            e = data[0]
+            bids = [(fp(x[0]), fp(x[1])) for x in (e.get("bids") or []) if len(x) >= 2]
+            asks = [(fp(x[0]), fp(x[1])) for x in (e.get("asks") or []) if len(x) >= 2]
+            bids = [(p, q) for p, q in bids if p is not None and q is not None]
+            asks = [(p, q) for p, q in asks if p is not None and q is not None]
+            return [self._depth_row(sid, sym, lv, e.get("ts") or d.get("ts"), bids, asks)]
+        if et == "bybit" and book is not None:
+            data = d.get("data")
+            if not data:
+                return []
+            if d.get("type") == "snapshot":
+                book["b"].clear(); book["a"].clear()
+            for side in ("b", "a"):
+                for entry in (data.get(side) or []):
+                    p = fp(entry[0]); q = fp(entry[1])
+                    if p is None:
+                        continue
+                    if q == 0.0:
+                        book[side].pop(p, None)
+                    else:
+                        book[side][p] = q
+            # throttle emit to ~10/s (deltas can arrive much faster); the book
+            # is still updated on every message above.
+            t = time.monotonic()
+            if t - book.get("_t", 0.0) < 0.1:
+                return []
+            book["_t"] = t
+            return [self._depth_row(sid, sym, lv, d.get("ts"),
+                                    list(book["b"].items()), list(book["a"].items()))]
+        return []
+
+    async def _run_venue_depth(self, cfg: _VenueDepthConfig) -> None:
+        name = cfg.exchange_tag + "-" + cfg.symbol + "-depth"
+        backoff = self._backoff_initial
+        while self._running:
+            ping_task: asyncio.Task | None = None
+            book: dict | None = {"b": {}, "a": {}, "_t": 0.0} if cfg.maintain else None
+            try:
+                assert self._session is not None and cfg.depth_key is not None
+                async with self._session.ws_connect(cfg.ws_url, heartbeat=20) as ws:
+                    await ws.send_json(cfg.subscribe_payload)
+                    logger.info("WS %s connected", name)
+                    backoff = self._backoff_initial
+                    last = time.monotonic()
+                    if cfg.exchange_tag == "bitget":
+                        async def _ping() -> None:
+                            try:
+                                while not ws.closed:
+                                    await asyncio.sleep(20)
+                                    if not ws.closed:
+                                        await ws.send_str("ping")
+                            except Exception:
+                                pass
+                        ping_task = asyncio.create_task(_ping())
+                    async for msg in ws:
+                        if not self._running:
+                            break
+                        if msg.type == aiohttp.WSMsgType.TEXT:
+                            if msg.data == "pong":
+                                continue
+                            try:
+                                d = orjson.loads(msg.data)
+                            except Exception:
+                                continue
+                            rows = self._parse_venue_depth(cfg, d, book)
+                            if rows:
+                                last = time.monotonic()
+                                self._rec.record_preformed_rows(cfg.depth_key, rows)
+                        elif msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSED):
+                            break
+                        if time.monotonic() - last > self._idle_max:
+                            logger.warning("WS %s idle -> reconnect", name)
+                            break
+            except asyncio.CancelledError:
+                if ping_task:
+                    ping_task.cancel()
+                return
+            except Exception as e:
+                logger.error("WS %s error: %r", name, e)
+            finally:
+                if ping_task:
+                    ping_task.cancel()
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, self._backoff_max)
 
     async def _run_coinbase(self) -> None:
         backoff = self._backoff_initial
